@@ -116,32 +116,37 @@ else:
 if st.session_state.awaiting_explanation:
     st.subheader("Tell us why you chose that:")
     reason = st.text_area("Your explanation:", key=f"reason_{idx}")
-    if st.button("Next Video", key=f"next_{idx}"):
+    col_next, col_back = st.columns([2, 1])
+    if col_next.button("Next Video", key=f"next_{idx}"):
         ann = st.session_state.current_ann
         ann["explanation"] = reason
         ann["timestamp"] = datetime.now(timezone.utc).isoformat()
+        with st.spinner("Saving your answer..."):
+            save_annotation(ann, video_path)
+            st.session_state.annotations.append(ann)
 
-        save_annotation(ann, video_path)
-        st.session_state.annotations.append(ann)
-
-        row = [
-            st.session_state.user_id,
-            idx + 1,
-            str(video_path),
-            video_path.name,
-            video_path.parent.name,  # label of video (fake or real)
-            "Yes" if ann["ai_generated"] else "No",
-            reason,
-            ann["timestamp"],
-        ]
-        try:
-            send_to_google_sheet(row)
-        except Exception as e:  # pylint: disable=broad-except
-            st.error(f"❌ Error writing to Google Sheet: {e}")
+            row = [
+                st.session_state.user_id,
+                idx + 1,
+                str(video_path),
+                video_path.name,
+                video_path.parent.name,  # label of video (fake or real)
+                "Yes" if ann["ai_generated"] else "No",
+                reason,
+                ann["timestamp"],
+            ]
+            try:
+                send_to_google_sheet(row)
+            except Exception as e:  # pylint: disable=broad-except
+                st.error(f"❌ Error writing to Google Sheet: {e}")
 
         st.session_state.awaiting_explanation = False
         st.session_state.current_ann = {}
         st.session_state.video_index += 1
+        st.rerun()
+    if col_back.button("Change Answer", key=f"back_{idx}"):
+        st.session_state.awaiting_explanation = False
+        st.session_state.current_ann = {}
         st.rerun()
     st.stop()
 
