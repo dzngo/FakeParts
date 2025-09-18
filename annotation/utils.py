@@ -15,7 +15,9 @@ import os
 import random
 import shutil
 import string
+import subprocess
 import tempfile
+from hashlib import md5
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,6 +57,7 @@ SHEET_HEADER: Sequence[str] = (
 )
 DRIVE_CACHE_DIR = Path(tempfile.gettempdir()) / "fakeparts_drive_cache"
 DRIVE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+NO_AUDIO_SUFFIX = ".noaudio"
 
 
 def _cleanup_drive_cache() -> None:
@@ -149,6 +152,8 @@ _DRIVE_SERVICE = None
 _SHEET_CLIENT = None
 _SHEET_HEADER_INITIALIZED = False
 _SHEET_WORKSHEET = None
+_FFMPEG_BIN = None
+_FFMPEG_REENCODE_WARNED = False
 
 
 def get_credentials():
@@ -206,9 +211,116 @@ def get_drive_service():
     return _DRIVE_SERVICE
 
 
+def _get_ffmpeg() -> str:
+    """Return path to ffmpeg binary or stop the app if unavailable."""
+
+    global _FFMPEG_BIN
+    if _FFMPEG_BIN is None:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            st.error(
+                "ffmpeg not found in PATH. Install ffmpeg locally and add it to `packages.txt` "
+                "for Streamlit Cloud deployments to remove audio before playback."
+            )
+            st.stop()
+        _FFMPEG_BIN = ffmpeg_path
+    return _FFMPEG_BIN
+
+
+def strip_audio(source: Path, destination: Path) -> bool:
+    """Copy ``source`` to ``destination`` without audio using ffmpeg."""
+
+    global _FFMPEG_REENCODE_WARNED
+    ffmpeg = _get_ffmpeg()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_handle = tempfile.NamedTemporaryFile(
+        prefix=destination.stem + "_",
+        suffix=destination.suffix,
+        dir=destination.parent,
+        delete=False,
+    )
+    temp_output = Path(tmp_handle.name)
+    tmp_handle.close()
+
+    def _run(cmd) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+
+    common_flags = []
+    if destination.suffix.lower() == ".mp4":
+        common_flags.extend(["-movflags", "+faststart"])
+
+    primary_cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-c:v",
+        "copy",
+        "-an",
+        *common_flags,
+        str(temp_output),
+    ]
+
+    try:
+        _run(primary_cmd)
+    except subprocess.CalledProcessError:
+        if not _FFMPEG_REENCODE_WARNED:
+            st.warning(
+                "Direct stream copy failed while stripping audio. Falling back to video re-encoding; "
+                "this may take longer."
+            )
+            _FFMPEG_REENCODE_WARNED = True
+
+        fallback_cmd = [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(source),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-an",
+            *common_flags,
+            str(temp_output),
+        ]
+        try:
+            _run(fallback_cmd)
+        except subprocess.CalledProcessError as err:
+            message = err.stderr.strip().splitlines()[-1] if err.stderr else str(err)
+            st.error(f"ffmpeg failed to strip audio from '{source.name}': {message}")
+            temp_output.unlink(missing_ok=True)
+            return False
+
+    try:
+        temp_output.replace(destination)
+    except OSError as err:
+        st.error(f"Unable to finalize audio-free copy for '{source.name}': {err}")
+        temp_output.unlink(missing_ok=True)
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Google Sheets helpers
 # ---------------------------------------------------------------------------
+def _column_label(index: int) -> str:
+    """Return Excel-style column label for 1-based ``index``."""
+
+    label = ""
+    while index > 0:
+        index, remainder = divmod(index - 1, 26)
+        label = chr(65 + remainder) + label
+    return label
 
 
 def send_to_google_sheet(data_row: Sequence[str]) -> None:
@@ -235,11 +347,17 @@ def send_to_google_sheet(data_row: Sequence[str]) -> None:
 
     try:
         if not _SHEET_HEADER_INITIALIZED:
-            if not _SHEET_WORKSHEET.get_all_values():
-                _SHEET_WORKSHEET.append_row(SHEET_HEADER, value_input_option="USER_ENTERED")
+            first_row = _SHEET_WORKSHEET.row_values(1)
+            if list(first_row[: len(SHEET_HEADER)]) != list(SHEET_HEADER):
+                _SHEET_WORKSHEET.update("A1", [SHEET_HEADER])
             _SHEET_HEADER_INITIALIZED = True
 
-        _SHEET_WORKSHEET.append_row(list(data_row), value_input_option="USER_ENTERED")
+        end_column = _column_label(len(SHEET_HEADER))
+        _SHEET_WORKSHEET.append_rows(
+            [list(data_row)],
+            value_input_option="USER_ENTERED",
+            table_range=f"A:{end_column}",
+        )
     except Exception as err:  # pylint: disable=broad-except
         st.error(f"Unable to append row to Google Sheet: {err}")
 
@@ -313,6 +431,71 @@ def list_video_entries(folder: Union[DriveFolder, Path, str], exts: Sequence[str
         return []
 
 
+def ensure_local_drive_copy(video: DriveVideo, remove_audio: bool = True) -> Optional[Path]:
+    """Create a cached local copy of ``video`` and optionally strip its audio."""
+
+    suffix = Path(video.name).suffix or ".mp4"
+    original = DRIVE_CACHE_DIR / f"{video.id}{suffix}"
+
+    if not original.exists():
+        service = get_drive_service()
+        request = service.files().get_media(fileId=video.id)  # pylint: disable=no-member
+
+        try:
+            with open(original, "wb") as handle:
+                downloader = MediaIoBaseDownload(handle, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+        except HttpError as err:
+            st.error(f"Error downloading video (ID: {video.id}): {err}")
+            if original.exists():
+                original.unlink(missing_ok=True)
+            return None
+        except Exception as err:  # pylint: disable=broad-except
+            st.error(f"Unexpected error downloading video '{video.name}': {err}")
+            if original.exists():
+                original.unlink(missing_ok=True)
+            return None
+
+    if not remove_audio:
+        return original
+
+    muted = DRIVE_CACHE_DIR / f"{video.id}{NO_AUDIO_SUFFIX}{suffix}"
+    needs_refresh = not muted.exists() or muted.stat().st_mtime < original.stat().st_mtime
+    if needs_refresh:
+        if not strip_audio(original, muted):
+            return None
+    return muted
+
+
+def ensure_local_file_copy(path: Path, remove_audio: bool = True) -> Optional[Path]:
+    """Return a local path to ``path`` with audio removed when requested."""
+
+    if not path.exists():
+        st.error(f"Video file '{path}' does not exist.")
+        return None
+    if not remove_audio:
+        return path
+
+    digest = md5(str(path.resolve()).encode("utf-8")).hexdigest()
+    fallback_suffix = path.suffix if path.suffix else ".mp4"
+    muted = DRIVE_CACHE_DIR / f"local_{digest}{NO_AUDIO_SUFFIX}{fallback_suffix}"
+    needs_refresh = not muted.exists() or muted.stat().st_mtime < path.stat().st_mtime
+    if needs_refresh:
+        if not strip_audio(path, muted):
+            return None
+    return muted
+
+
+def get_playback_path(video, remove_audio: bool = True) -> Optional[Path]:
+    """Return a filesystem path ready for playback, muting audio if requested."""
+
+    if is_drive_video(video):
+        return ensure_local_drive_copy(video, remove_audio=remove_audio)
+    return ensure_local_file_copy(Path(video), remove_audio=remove_audio)
+
+
 def _folder_name(folder: Union[DriveFolder, Path, str]) -> str:
     if isinstance(folder, DriveFolder):
         return folder.label
@@ -330,37 +513,6 @@ def is_drive_video(obj) -> bool:
     """
 
     return hasattr(obj, "id") and hasattr(obj, "name")
-
-
-def ensure_local_drive_copy(video: DriveVideo) -> Optional[Path]:
-    """Create a cached local copy of ``video`` and return its filesystem path."""
-
-    suffix = Path(video.name).suffix or ".mp4"
-    target = DRIVE_CACHE_DIR / f"{video.id}{suffix}"
-    if target.exists():
-        return target
-
-    service = get_drive_service()
-    request = service.files().get_media(fileId=video.id)  # pylint: disable=no-member
-
-    try:
-        with open(target, "wb") as handle:
-            downloader = MediaIoBaseDownload(handle, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-    except HttpError as err:
-        st.error(f"Error downloading video (ID: {video.id}): {err}")
-        if target.exists():
-            target.unlink(missing_ok=True)
-        return None
-    except Exception as err:  # pylint: disable=broad-except
-        st.error(f"Unexpected error downloading video '{video.name}': {err}")
-        if target.exists():
-            target.unlink(missing_ok=True)
-        return None
-
-    return target
 
 
 def video_mime(video: DriveVideo) -> Optional[str]:
@@ -455,11 +607,14 @@ __all__ = [
     "send_to_google_sheet",
     "list_drive_entries",
     "list_video_entries",
+    "ensure_local_drive_copy",
+    "ensure_local_file_copy",
+    "get_playback_path",
+    "strip_audio",
     "sample_and_mix",
     "resolve_video_sources",
     "save_annotation",
     "is_drive_video",
-    "ensure_local_drive_copy",
     "video_mime",
     "get_credentials",
     "get_drive_service",

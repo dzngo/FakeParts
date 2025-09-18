@@ -35,8 +35,8 @@ import streamlit as st
 
 from utils import (
     DEFAULT_SAMPLE_SIZE,
-    ensure_local_drive_copy,
     generate_user_id,
+    get_playback_path,
     is_drive_video,
     resolve_video_sources,
     sample_and_mix,
@@ -100,15 +100,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+playback_path = get_playback_path(video_path)
+if not playback_path or not playback_path.exists():
+    st.error("Unable to load video for playback. Please try again later.")
+    st.stop()
+
 if is_drive_video(video_path):
-    local_path = ensure_local_drive_copy(video_path)
-    if local_path and local_path.exists():
-        st.video(str(local_path), format=video_mime(video_path), start_time=0)
-    else:
-        st.error("Unable to load video from Google Drive. Please try again later.")
-        st.stop()
+    st.video(str(playback_path), format=video_mime(video_path), start_time=0)
 else:
-    st.video(str(video_path))
+    st.video(str(playback_path))
 
 if st.session_state.awaiting_explanation:
     st.subheader("Tell us why you chose that:")
