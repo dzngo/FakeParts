@@ -66,9 +66,11 @@ st.title("AI-Generated Video Detection")
 st.markdown(f"**🆔 Your session ID:** `{st.session_state.user_id}`")
 
 if not st.session_state.video_list:
-    sources = resolve_video_sources()
-    videos = sample_and_mix(*sources, n_each=DEFAULT_SAMPLE_SIZE)
+    with st.spinner("Preparing videos, please wait..."):
+        sources = resolve_video_sources()
+        videos = sample_and_mix(*sources, n_each=DEFAULT_SAMPLE_SIZE)
     if not videos:
+        st.error("No videos available to annotate right now.")
         st.stop()
     st.session_state.video_list = videos
 
@@ -100,7 +102,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-playback_path = get_playback_path(video_path)
+with st.spinner("Retrieving video..."):
+    playback_path = get_playback_path(video_path)
 if not playback_path or not playback_path.exists():
     st.error("Unable to load video for playback. Please try again later.")
     st.stop()
