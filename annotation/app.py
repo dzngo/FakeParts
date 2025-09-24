@@ -38,8 +38,7 @@ from utils import (
     generate_user_id,
     get_playback_path,
     is_drive_video,
-    resolve_video_sources,
-    sample_and_mix,
+    sample_videos,
     save_annotation,
     send_to_google_sheet,
     video_mime,
@@ -67,8 +66,7 @@ st.markdown(f"**🆔 Your session ID:** `{st.session_state.user_id}`")
 
 if not st.session_state.video_list:
     with st.spinner("Preparing videos, please wait..."):
-        sources = resolve_video_sources()
-        videos = sample_and_mix(*sources, n_each=DEFAULT_SAMPLE_SIZE)
+        videos = sample_videos(DEFAULT_SAMPLE_SIZE)
     if not videos:
         st.error("No videos available to annotate right now.")
         st.stop()
@@ -130,7 +128,8 @@ if st.session_state.awaiting_explanation:
                 idx + 1,
                 str(video_path),
                 video_path.name,
-                video_path.parent.name,  # label of video (fake or real)
+                video_path.label,
+                getattr(video_path, "method", ""),
                 "Yes" if ann["ai_generated"] else "No",
                 reason,
                 ann["timestamp"],
@@ -156,7 +155,8 @@ col1, col2 = st.columns(2)
 if col1.button("Yes", key=f"yes_{idx}"):
     st.session_state.current_ann = {
         "video": video_path.name,
-        "ground_truth": video_path.parent.name,
+        "ground_truth": video_path.label,
+        "method": getattr(video_path, "method", ""),
         "ai_generated": True,
         "video_url": str(video_path),
         "video_source": "drive" if is_drive_video(video_path) else "local",
@@ -168,7 +168,8 @@ if col1.button("Yes", key=f"yes_{idx}"):
 if col2.button("No", key=f"no_{idx}"):
     st.session_state.current_ann = {
         "video": video_path.name,
-        "ground_truth": video_path.parent.name,
+        "ground_truth": video_path.label,
+        "method": getattr(video_path, "method", ""),
         "ai_generated": False,
         "video_url": str(video_path),
         "video_source": "drive" if is_drive_video(video_path) else "local",
