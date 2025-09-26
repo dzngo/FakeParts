@@ -12,11 +12,11 @@ serves them for evalutation, and stores the answers in Google Sheets.
    ```json
    {
      "Fake": {
-       "Outpainting-AKiRa": "<drive-folder-id>",
-       "Inpainting VOS2019-Propainter": "<drive-folder-id>"
+       "Outpainting-AKiRa": ["<drive-folder-id>", "<another-folder-id>"],
+       "Inpainting VOS2019-Propainter": ["<drive-folder-id>"]
      },
      "Real": {
-       "Real": "<drive-folder-id>"
+       "Real": ["<drive-folder-id>"]
      }
    }
    ```

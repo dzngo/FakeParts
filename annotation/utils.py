@@ -12,7 +12,6 @@ supporting scripts:
 from __future__ import annotations
 
 import atexit
-import csv
 import json
 import os
 import random
@@ -142,7 +141,6 @@ _SHEET_HEADER_INITIALIZED = False
 _SHEET_WORKSHEET = None
 _FFMPEG_BIN = None
 _FFMPEG_REENCODE_WARNED = False
-_VIDEO_CATALOG_CACHE: Optional[List[DriveVideo]] = None
 
 
 def get_credentials():
@@ -218,6 +216,7 @@ def get_drive_service():
 # ---------------------------------------------------------------------------
 # ffmpeg helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_ffmpeg() -> str:
     global _FFMPEG_BIN
@@ -320,6 +319,7 @@ def strip_audio(source: Path, destination: Path) -> bool:
 # Google Sheets helper
 # ---------------------------------------------------------------------------
 
+
 def _column_label(index: int) -> str:
     label = ""
     while index > 0:
@@ -388,9 +388,7 @@ def get_video_catalog() -> List[DriveVideo]:
         try:
             worksheet = sheet.worksheet(VIDEO_CATALOG_WORKSHEET)
         except WorksheetNotFound:
-            st.error(
-                f"Worksheet '{VIDEO_CATALOG_WORKSHEET}' not found in the video catalogue sheet."
-            )
+            st.error(f"Worksheet '{VIDEO_CATALOG_WORKSHEET}' not found in the video catalogue sheet.")
             st.stop()
     else:
         worksheet = sheet.sheet1
@@ -500,6 +498,7 @@ def sample_videos(total: int = DEFAULT_SAMPLE_SIZE) -> List[DriveVideo]:
 # Playback helpers
 # ---------------------------------------------------------------------------
 
+
 def ensure_local_drive_copy(video: DriveVideo, remove_audio: bool = True) -> Optional[Path]:
     suffix = Path(video.name).suffix or ".mp4"
     original = DRIVE_CACHE_DIR / f"{video.id}{suffix}"
@@ -553,6 +552,7 @@ def is_drive_video(obj) -> bool:
 # ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
+
 
 def save_annotation(ann: dict, video_path: DriveVideo, base: str = "annotations") -> None:
     sub = video_path.label

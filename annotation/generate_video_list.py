@@ -29,7 +29,7 @@ def iter_drive_videos(root_id: str) -> Iterable[Dict[str, str]]:
 
     while queue:
         current = queue.pop()
-        info = service.files().get(fileId=current, fields="name").execute()
+        info = service.files().get(fileId=current, fields="name").execute()  # pylint: disable=no-member
         folder_name = info.get("name", current)
         print(f"  - scanning folder {folder_name} ({current})...")
         page_token = None
@@ -61,23 +61,33 @@ def iter_drive_videos(root_id: str) -> Iterable[Dict[str, str]]:
                 break
 
 
-def build_catalog(mapping: Dict[str, Dict[str, str]]) -> List[Dict[str, str]]:
+def _ensure_list(value):
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value]
+    return [str(value)]
+
+
+def build_catalog(mapping: Dict[str, Dict[str, object]]) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     for category, folders in mapping.items():
-        for method, folder_id in folders.items():
-            folder_info = get_drive_service().files().get(fileId=folder_id, fields="name").execute()
-            folder_name = folder_info.get("name", folder_id)
-            print(f"Scanning {category}/{method} - {folder_name} ({folder_id})")
-            for item in iter_drive_videos(folder_id):
-                rows.append(
-                    {
-                        "category": category,
-                        "method": method,
-                        "drive_id": item["drive_id"],
-                        "name": item["name"],
-                        "mime_type": item.get("mime_type", ""),
-                    }
-                )
+        for method, folder_ids in folders.items():
+            for folder_id in _ensure_list(folder_ids):
+                info = get_drive_service().files().get(fileId=folder_id, fields="name").execute()  # pylint: disable=no-member
+                folder_name = info.get("name", folder_id)
+                print(f"Scanning {category}/{method} - {folder_name} ({folder_id})")
+                count = 0
+                for item in iter_drive_videos(folder_id):
+                    rows.append(
+                        {
+                            "category": category,
+                            "method": method,
+                            "drive_id": item["drive_id"],
+                            "name": item["name"],
+                            "mime_type": item.get("mime_type", ""),
+                        }
+                    )
+                    count += 1
+                print(f"    -> found {count} video(s)")
     return rows
 
 
