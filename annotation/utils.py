@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+import streamlit as st
+
 import gspread
 import streamlit as st
 from googleapiclient.discovery import build
@@ -302,14 +304,14 @@ def strip_audio(source: Path, destination: Path) -> bool:
             _run(fallback_cmd)
         except subprocess.CalledProcessError as err:
             message = err.stderr.strip().splitlines()[-1] if err.stderr else str(err)
-            st.error(f"ffmpeg failed to strip audio from '{source.name}': {message}")
+            # st.error(f"ffmpeg failed to strip audio from '{source.name}': {message}")
             temp_output.unlink(missing_ok=True)
             return False
 
     try:
         temp_output.replace(destination)
     except OSError as err:
-        st.error(f"Unable to finalize audio-free copy for '{source.name}': {err}")
+        # st.error(f"Unable to finalize audio-free copy for '{source.name}': {err}")
         temp_output.unlink(missing_ok=True)
         return False
     return True
@@ -413,85 +415,129 @@ def get_video_catalog() -> List[DriveVideo]:
     return videos
 
 
-def _sample_fake_videos(fake_videos: List[DriveVideo], quota: int) -> List[DriveVideo]:
-    if quota <= 0 or not fake_videos:
-        return []
+@st.cache_data(show_spinner=False)
+def build_video_pools() -> dict[str, dict[str, List[DriveVideo]]]:
+    pools: dict[str, dict[str, List[DriveVideo]]] = {}
+    for video in get_video_catalog():
+        pools.setdefault(video.label, {}).setdefault(video.method, []).append(video)
+    for label_dict in pools.values():
+        for videos in label_dict.values():
+            random.shuffle(videos)
+    return pools
 
-    by_method: dict[str, List[DriveVideo]] = {}
-    for video in fake_videos:
-        by_method.setdefault(video.method, []).append(video)
 
-    methods = list(by_method.keys())
+def shuffle_video_pools(pools: dict[str, dict[str, List[DriveVideo]]]):
+    for label_dict in pools.values():
+        for videos in label_dict.values():
+            random.shuffle(videos)
+
+
+def _pop_from_method(pools: dict[str, dict[str, List[DriveVideo]]], label: str, method: str) -> Optional[DriveVideo]:
+    label_dict = pools.get(label, {})
+    bucket = label_dict.get(method)
+    if bucket:
+        return bucket.pop()
+    return None
+
+
+def _pop_any_from_label(pools: dict[str, dict[str, List[DriveVideo]]], label: str) -> Optional[DriveVideo]:
+    label_dict = pools.get(label, {})
+    available = [m for m, videos in label_dict.items() if videos]
+    if not available:
+        return None
+    method = random.choice(available)
+    return label_dict[method].pop()
+
+
+def _pop_fake_balanced(pools: dict[str, dict[str, List[DriveVideo]]], quota: int) -> List[DriveVideo]:
+    result: List[DriveVideo] = []
+    label_dict = pools.get("Fake", {})
+    methods = [m for m, videos in label_dict.items() if videos]
+    if quota <= 0 or not methods:
+        return result
+
     random.shuffle(methods)
-
     allocations: dict[str, int] = {method: 0 for method in methods}
+    available = {method: len(label_dict[method]) for method in methods}
+
     if quota <= len(methods):
         for method in methods[:quota]:
             allocations[method] = 1
     else:
         base = quota // len(methods)
-        remainder = quota % len(methods)
         for method in methods:
-            allocations[method] = min(base, len(by_method[method]))
-        for method in methods:
-            if remainder <= 0:
+            allocations[method] = min(base, available[method])
+        remaining = quota - sum(allocations.values())
+        while remaining > 0:
+            candidates = [m for m in methods if allocations[m] < available[m]]
+            if not candidates:
                 break
-            if allocations[method] < len(by_method[method]):
+            for method in candidates:
+                if remaining == 0:
+                    break
                 allocations[method] += 1
-                remainder -= 1
+                remaining -= 1
 
-    selected: List[DriveVideo] = []
-    leftovers: List[DriveVideo] = []
     for method in methods:
-        bucket = by_method[method][:]
-        random.shuffle(bucket)
-        want = allocations[method]
-        picked = bucket[:want]
-        selected.extend(picked)
-        leftovers.extend(bucket[want:])
+        count = allocations.get(method, 0)
+        for _ in range(count):
+            video = _pop_from_method(pools, "Fake", method)
+            if video:
+                result.append(video)
 
-    if len(selected) < quota:
-        random.shuffle(leftovers)
-        for video in leftovers:
-            if len(selected) >= quota:
-                break
-            selected.append(video)
-
-    random.shuffle(selected)
-    return selected[:quota]
+    return result
 
 
-def sample_videos(total: int = DEFAULT_SAMPLE_SIZE) -> List[DriveVideo]:
-    catalog = get_video_catalog()
-    if not catalog:
+def _pop_real_videos(pools: dict[str, dict[str, List[DriveVideo]]], quota: int) -> List[DriveVideo]:
+    result: List[DriveVideo] = []
+    if quota <= 0:
+        return result
+
+    label_dict = pools.get("Real", {})
+    while len(result) < quota:
+        candidates = [m for m, videos in label_dict.items() if videos]
+        if not candidates:
+            break
+        method = random.choice(candidates)
+        result.append(label_dict[method].pop())
+    return result
+
+
+def sample_initial_videos(
+    pools: dict[str, dict[str, List[DriveVideo]]], total: int = DEFAULT_SAMPLE_SIZE
+) -> List[DriveVideo]:
+    available_fake = sum(len(videos) for videos in pools.get("Fake", {}).values())
+    available_real = sum(len(videos) for videos in pools.get("Real", {}).values())
+    if available_fake == 0 or available_real == 0:
         return []
 
-    by_category: dict[str, List[DriveVideo]] = {"Fake": [], "Real": []}
-    for video in catalog:
-        by_category.setdefault(video.label, []).append(video)
+    target_fake = min(total // 2, available_fake)
+    target_real = min(total // 2, available_real)
+    remaining = total - (target_fake + target_real)
 
-    fake_videos = by_category.get("Fake", [])
-    real_videos = by_category.get("Real", [])
-    if not fake_videos or not real_videos:
-        return []
+    while remaining > 0:
+        if target_fake < available_fake:
+            target_fake += 1
+            remaining -= 1
+        elif target_real < available_real:
+            target_real += 1
+            remaining -= 1
+        else:
+            break
 
-    target_per_class = max(1, total // 2)
-    max_possible = min(len(fake_videos), len(real_videos))
-    target_per_class = min(target_per_class, max_possible)
-
-    random.shuffle(real_videos)
-    real_selection = real_videos[:target_per_class]
-
-    fake_selection = _sample_fake_videos(fake_videos, target_per_class)
-    if len(fake_selection) < target_per_class:
-        remaining = [v for v in fake_videos if v not in fake_selection]
-        random.shuffle(remaining)
-        fake_selection.extend(remaining[: target_per_class - len(fake_selection)])
-        fake_selection = fake_selection[:target_per_class]
+    fake_selection = _pop_fake_balanced(pools, target_fake)
+    real_selection = _pop_real_videos(pools, target_real)
 
     combined = fake_selection + real_selection
     random.shuffle(combined)
     return combined
+
+
+def fetch_replacement(pools: dict[str, dict[str, List[DriveVideo]]], label: str, method: str) -> Optional[DriveVideo]:
+    replacement = _pop_from_method(pools, label, method)
+    if replacement:
+        return replacement
+    return _pop_any_from_label(pools, label)
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +545,7 @@ def sample_videos(total: int = DEFAULT_SAMPLE_SIZE) -> List[DriveVideo]:
 # ---------------------------------------------------------------------------
 
 
-def ensure_local_drive_copy(video: DriveVideo, remove_audio: bool = True) -> Optional[Path]:
+def ensure_local_drive_copy(video: DriveVideo, remove_audio: bool = False) -> Optional[Path]:
     suffix = Path(video.name).suffix or ".mp4"
     original = DRIVE_CACHE_DIR / f"{video.id}{suffix}"
 
@@ -513,13 +559,13 @@ def ensure_local_drive_copy(video: DriveVideo, remove_audio: bool = True) -> Opt
                 done = False
                 while not done:
                     _, done = downloader.next_chunk()
-        except HttpError as err:
-            st.error(f"Error downloading video (ID: {video.id}): {err}")
+        except HttpError:
+            # st.error(f"Error downloading video (ID: {video.id}): {err}")
             if original.exists():
                 original.unlink(missing_ok=True)
             return None
-        except Exception as err:  # pylint: disable=broad-except
-            st.error(f"Unexpected error downloading video '{video.name}': {err}")
+        except Exception:  # pylint: disable=broad-except
+            # st.error(f"Unexpected error downloading video '{video.name}': {err}")
             if original.exists():
                 original.unlink(missing_ok=True)
             return None
@@ -577,7 +623,9 @@ __all__ = [
     "generate_user_id",
     "send_to_google_sheet",
     "get_video_catalog",
-    "sample_videos",
+    "build_video_pools",
+    "sample_initial_videos",
+    "fetch_replacement",
     "get_playback_path",
     "ensure_local_drive_copy",
     "video_mime",

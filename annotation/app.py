@@ -30,19 +30,28 @@ On Streamlit Cloud, paste the same keys under App → Settings → Secrets.
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+import threading
 
 import streamlit as st
 
 from utils import (
     DEFAULT_SAMPLE_SIZE,
+    build_video_pools,
+    fetch_replacement,
     generate_user_id,
     get_playback_path,
     is_drive_video,
-    sample_videos,
+    sample_initial_videos,
     save_annotation,
     send_to_google_sheet,
     video_mime,
+    shuffle_video_pools,
 )
+
+
+@st.cache_resource(show_spinner=False)
+def get_video_loading_lock():
+    return threading.Lock()
 
 
 # Session State Initialization
@@ -50,44 +59,71 @@ if "user_id" not in st.session_state:
     st.session_state.user_id = generate_user_id()
 if "video_index" not in st.session_state:
     st.session_state.video_index = 0
-if "annotations" not in st.session_state:
-    st.session_state.annotations = []
+# if "annotations" not in st.session_state:
+#     st.session_state.annotations = []
 if "video_list" not in st.session_state:
     st.session_state.video_list = []
 if "awaiting_explanation" not in st.session_state:
     st.session_state.awaiting_explanation = False
 if "current_ann" not in st.session_state:
     st.session_state.current_ann = {}
+if "video_pools" not in st.session_state:
+    st.session_state.video_pools = {}
 
 
 # ---------------- UI START ----------------
 st.title("AI-Generated Video Detection")
 st.markdown(f"**🆔 Your session ID:** `{st.session_state.user_id}`")
 
+if not st.session_state.video_pools:
+    with st.spinner("Loading video catalogue..."):
+        st.session_state.video_pools = build_video_pools()
+
 if not st.session_state.video_list:
     with st.spinner("Preparing videos, please wait..."):
-        videos = sample_videos(DEFAULT_SAMPLE_SIZE)
+        # video_pools needs to be shuffled here to make sure the randomness
+        # because build_video_pools has st.cache
+        shuffle_video_pools(st.session_state.video_pools)
+        videos = sample_initial_videos(st.session_state.video_pools, DEFAULT_SAMPLE_SIZE)
     if not videos:
         st.error("No videos available to annotate right now.")
         st.stop()
     st.session_state.video_list = videos
 
+
+def ensure_video_playback(video_idx: int):
+    with get_video_loading_lock():
+        attempts = 0
+        while attempts < 10:
+            video = st.session_state.video_list[video_idx]
+            playback_pth = get_playback_path(video, remove_audio=False)
+            if playback_pth:
+                return playback_pth, video
+            replacement = fetch_replacement(
+                st.session_state.video_pools,
+                video.label,
+                getattr(video, "method", ""),
+            )
+            st.session_state.video_list[video_idx] = replacement
+            attempts += 1
+        return None, st.session_state.video_list[video_idx]
+
+
 total = len(st.session_state.video_list)
 
 if st.session_state.video_index >= total:
     st.write("### 🎉 All videos done. Thank you!")
-    master = Path("annotations") / "all_annotations.json"
-    master.parent.mkdir(exist_ok=True)
-    with open(master, "w", encoding="utf-8") as f:
-        json.dump(st.session_state.annotations, f, indent=4)
+    # master = Path("annotations") / "all_annotations.json"
+    # master.parent.mkdir(exist_ok=True)
+    # with open(master, "w", encoding="utf-8") as f:
+    #     json.dump(st.session_state.annotations, f, indent=4)
 
-    correct = sum(1 for ann in st.session_state.annotations if ann["ai_generated"] == (ann["ground_truth"] == "Fake"))
-    st.markdown(f"## You classified **{correct}/{total}** videos correctly!")
+    # correct = sum(1 for ann in st.session_state.annotations if ann["ai_generated"] == (ann["ground_truth"] == "Fake"))
+    # st.markdown(f"## You classified **{correct}/{total}** videos correctly!")
     st.balloons()
     st.stop()
 
 idx = st.session_state.video_index
-video_path = st.session_state.video_list[idx]
 
 st.markdown(
     f"""
@@ -99,12 +135,12 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 with st.spinner("Retrieving video..."):
-    playback_path = get_playback_path(video_path)
-if not playback_path or not playback_path.exists():
-    st.error("Unable to load video for playback. Please try again later.")
-    st.stop()
+    playback_path, video_path = ensure_video_playback(idx)
+
+if not playback_path:
+    st.session_state.video_index += 1
+    st.rerun()
 
 if is_drive_video(video_path):
     st.video(str(playback_path), format=video_mime(video_path), start_time=0)
@@ -120,8 +156,8 @@ if st.session_state.awaiting_explanation:
         ann["explanation"] = reason
         ann["timestamp"] = datetime.now(timezone.utc).isoformat()
         with st.spinner("Saving your answer..."):
-            save_annotation(ann, video_path)
-            st.session_state.annotations.append(ann)
+            # save_annotation(ann, video_path)
+            # st.session_state.annotations.append(ann)
 
             row = [
                 st.session_state.user_id,
