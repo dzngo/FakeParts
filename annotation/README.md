@@ -41,6 +41,7 @@ GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/<sheet-id>"
 VIDEO_CATALOG_SHEET_URL = "https://docs.google.com/spreadsheets/d/<catalog-sheet-id>"
 VIDEO_CATALOG_WORKSHEET = "VideoCatalog"  # optional
 DEFAULT_SAMPLE_SIZE = 10  # optional override
+FAKE_METHODS_BALANCED = false  # optional override (set to true to balance fake methods)
 GCP_CREDENTIALS = '''{ ... service account JSON ... }'''  # or set GOOGLE_APPLICATION_CREDENTIALS
 ```
 
@@ -57,6 +58,7 @@ pip install -r requirements.txt
 streamlit run annotation/app.py
 ```
 
-The app will download the video catalogue, sample equal numbers of fake and real
-videos (balancing fake methods), remove their audio, and log each evaluation to
-Google Sheets.
+The app will download the video catalogue, sample equal numbers of fake and
+real videos, remove their audio, and log each evaluation to Google Sheets. Set
+`FAKE_METHODS_BALANCED=true` if you prefer to balance the sampled fake videos
+across methods.

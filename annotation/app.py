@@ -27,8 +27,8 @@ project root, e.g.:
 On Streamlit Cloud, paste the same keys under App → Settings → Secrets.
 """
 
-import json
-from pathlib import Path
+# import json
+# from pathlib import Path
 from datetime import datetime, timezone
 import threading
 
@@ -36,13 +36,14 @@ import streamlit as st
 
 from utils import (
     DEFAULT_SAMPLE_SIZE,
+    FAKE_METHODS_BALANCED,
     build_video_pools,
     fetch_replacement,
     generate_user_id,
     get_playback_path,
     is_drive_video,
     sample_initial_videos,
-    save_annotation,
+    # save_annotation,
     send_to_google_sheet,
     video_mime,
     shuffle_video_pools,
@@ -84,7 +85,11 @@ if not st.session_state.video_list:
         # video_pools needs to be shuffled here to make sure the randomness
         # because build_video_pools has st.cache
         shuffle_video_pools(st.session_state.video_pools)
-        videos = sample_initial_videos(st.session_state.video_pools, DEFAULT_SAMPLE_SIZE)
+        videos = sample_initial_videos(
+            st.session_state.video_pools,
+            DEFAULT_SAMPLE_SIZE,
+            fake_method_balanced=FAKE_METHODS_BALANCED,
+        )
     if not videos:
         st.error("No videos available to annotate right now.")
         st.stop()
@@ -99,11 +104,14 @@ def ensure_video_playback(video_idx: int):
             playback_pth = get_playback_path(video, remove_audio=False)
             if playback_pth:
                 return playback_pth, video
+            # If there is a problem of video loading, find a replacement
             replacement = fetch_replacement(
                 st.session_state.video_pools,
                 video.label,
                 getattr(video, "method", ""),
+                exclude=video,
             )
+
             st.session_state.video_list[video_idx] = replacement
             attempts += 1
         return None, st.session_state.video_list[video_idx]

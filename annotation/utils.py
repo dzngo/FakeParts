@@ -9,8 +9,6 @@ supporting scripts:
 * Persisting annotations and writing them to Google Sheets
 """
 
-from __future__ import annotations
-
 import atexit
 import json
 import os
@@ -21,12 +19,11 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
 
 import gspread
-import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
@@ -91,6 +88,19 @@ def _safe_int(value, fallback: int) -> int:
         return fallback
 
 
+def _safe_bool(value, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return fallback
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return fallback
+
+
 def _resolve_setting(key: str, default=""):
     """Return the configuration ``key`` preferring env vars then secrets."""
 
@@ -100,16 +110,19 @@ def _resolve_setting(key: str, default=""):
     return _get_secret(key, default)
 
 
-def _load_run_settings() -> Tuple[str, str, str, int]:
+def _load_run_settings() -> Tuple[str, str, str, int, bool]:
     sheet_url = _resolve_setting("GOOGLE_SHEET_URL", "") or ""
     catalog_sheet_url = _resolve_setting("VIDEO_CATALOG_SHEET_URL", "") or ""
     catalog_worksheet = _resolve_setting("VIDEO_CATALOG_WORKSHEET", "") or ""
     sample_raw = _resolve_setting("DEFAULT_SAMPLE_SIZE", DEFAULT_SAMPLE_SIZE)
     sample_size = _safe_int(sample_raw, DEFAULT_SAMPLE_SIZE)
-    return sheet_url, catalog_sheet_url, catalog_worksheet, sample_size
+    fake_method_balanced = _safe_bool(_resolve_setting("FAKE_METHODS_BALANCED"), False)
+    return sheet_url, catalog_sheet_url, catalog_worksheet, sample_size, fake_method_balanced
 
 
-GOOGLE_SHEET_URL, VIDEO_CATALOG_SHEET_URL, VIDEO_CATALOG_WORKSHEET, DEFAULT_SAMPLE_SIZE = _load_run_settings()
+GOOGLE_SHEET_URL, VIDEO_CATALOG_SHEET_URL, VIDEO_CATALOG_WORKSHEET, DEFAULT_SAMPLE_SIZE, FAKE_METHODS_BALANCED = (
+    _load_run_settings()
+)
 
 
 # ---------------------------------------------------------------------------
@@ -432,33 +445,34 @@ def shuffle_video_pools(pools: dict[str, dict[str, List[DriveVideo]]]):
             random.shuffle(videos)
 
 
-def _pop_from_method(pools: dict[str, dict[str, List[DriveVideo]]], label: str, method: str) -> Optional[DriveVideo]:
-    label_dict = pools.get(label, {})
-    bucket = label_dict.get(method)
-    if bucket:
-        return bucket.pop()
-    return None
-
-
-def _pop_any_from_label(pools: dict[str, dict[str, List[DriveVideo]]], label: str) -> Optional[DriveVideo]:
-    label_dict = pools.get(label, {})
-    available = [m for m, videos in label_dict.items() if videos]
-    if not available:
-        return None
-    method = random.choice(available)
-    return label_dict[method].pop()
-
-
-def _pop_fake_balanced(pools: dict[str, dict[str, List[DriveVideo]]], quota: int) -> List[DriveVideo]:
+def _get_labeled_videos(pools: dict[str, dict[str, List[DriveVideo]]], label: str) -> List[DriveVideo]:
     result: List[DriveVideo] = []
-    label_dict = pools.get("Fake", {})
-    methods = [m for m, videos in label_dict.items() if videos]
+    for videos in pools.get(label, {}).values():
+        result.extend(videos)
+    return result
+
+
+def _sample_from_method(
+    pools: dict[str, dict[str, List[DriveVideo]]], label: str, method: str, count: int
+) -> List[DriveVideo]:
+    pool = pools.get(label, {}).get(method, [])
+    if not pool or count <= 0:
+        return []
+    if count >= len(pool):
+        return list(pool)
+    return random.sample(pool, count)
+
+
+def _sample_fake_balanced(pools: dict[str, dict[str, List[DriveVideo]]], quota: int) -> List[DriveVideo]:
+    result: List[DriveVideo] = []
+    label_methods = pools.get("Fake", {})
+    methods = [method for method, videos in label_methods.items() if videos]
     if quota <= 0 or not methods:
         return result
 
     random.shuffle(methods)
-    allocations: dict[str, int] = {method: 0 for method in methods}
-    available = {method: len(label_dict[method]) for method in methods}
+    allocations: Dict[str, int] = {method: 0 for method in methods}
+    available_counts = {method: len(label_methods[method]) for method in methods}
 
     if quota <= len(methods):
         for method in methods[:quota]:
@@ -466,10 +480,10 @@ def _pop_fake_balanced(pools: dict[str, dict[str, List[DriveVideo]]], quota: int
     else:
         base = quota // len(methods)
         for method in methods:
-            allocations[method] = min(base, available[method])
+            allocations[method] = min(base, available_counts[method])
         remaining = quota - sum(allocations.values())
         while remaining > 0:
-            candidates = [m for m in methods if allocations[m] < available[m]]
+            candidates = [m for m in methods if allocations[m] < available_counts[m]]
             if not candidates:
                 break
             for method in candidates:
@@ -478,36 +492,23 @@ def _pop_fake_balanced(pools: dict[str, dict[str, List[DriveVideo]]], quota: int
                 allocations[method] += 1
                 remaining -= 1
 
-    for method in methods:
-        count = allocations.get(method, 0)
-        for _ in range(count):
-            video = _pop_from_method(pools, "Fake", method)
-            if video:
-                result.append(video)
+    for method, count in allocations.items():
+        if count <= 0:
+            continue
+        result.extend(_sample_from_method(pools, "Fake", method, count))
 
-    return result
-
-
-def _pop_real_videos(pools: dict[str, dict[str, List[DriveVideo]]], quota: int) -> List[DriveVideo]:
-    result: List[DriveVideo] = []
-    if quota <= 0:
-        return result
-
-    label_dict = pools.get("Real", {})
-    while len(result) < quota:
-        candidates = [m for m, videos in label_dict.items() if videos]
-        if not candidates:
-            break
-        method = random.choice(candidates)
-        result.append(label_dict[method].pop())
     return result
 
 
 def sample_initial_videos(
-    pools: dict[str, dict[str, List[DriveVideo]]], total: int = DEFAULT_SAMPLE_SIZE
+    pools: dict[str, dict[str, List[DriveVideo]]],
+    total: int = DEFAULT_SAMPLE_SIZE,
+    fake_method_balanced: bool = FAKE_METHODS_BALANCED,
 ) -> List[DriveVideo]:
-    available_fake = sum(len(videos) for videos in pools.get("Fake", {}).values())
-    available_real = sum(len(videos) for videos in pools.get("Real", {}).values())
+    fake_videos = _get_labeled_videos(pools, "Fake")
+    real_videos = _get_labeled_videos(pools, "Real")
+    available_fake = len(fake_videos)
+    available_real = len(real_videos)
     if available_fake == 0 or available_real == 0:
         return []
 
@@ -525,19 +526,33 @@ def sample_initial_videos(
         else:
             break
 
-    fake_selection = _pop_fake_balanced(pools, target_fake)
-    real_selection = _pop_real_videos(pools, target_real)
+    if fake_method_balanced:
+        fake_selection = _sample_fake_balanced(pools, target_fake)
+    else:
+        fake_selection = random.sample(fake_videos, target_fake)
+
+    real_selection = random.sample(real_videos, target_real)
 
     combined = fake_selection + real_selection
     random.shuffle(combined)
     return combined
 
 
-def fetch_replacement(pools: dict[str, dict[str, List[DriveVideo]]], label: str, method: str) -> Optional[DriveVideo]:
-    replacement = _pop_from_method(pools, label, method)
-    if replacement:
-        return replacement
-    return _pop_any_from_label(pools, label)
+def fetch_replacement(
+    pools: dict[str, dict[str, List[DriveVideo]]],
+    label: str,
+    method: str,
+    exclude: Optional[DriveVideo] = None,
+) -> Optional[DriveVideo]:
+    method_pool = pools.get(label, {}).get(method, [])
+    candidates = [video for video in method_pool if video is not exclude]
+    if candidates:
+        return random.choice(candidates)
+
+    fallback = [video for video in _get_labeled_videos(pools, label) if video is not exclude]
+    if fallback:
+        return random.choice(fallback)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -619,11 +634,13 @@ def generate_user_id(length: int = 6) -> str:
 __all__ = [
     "DriveVideo",
     "DEFAULT_SAMPLE_SIZE",
+    "FAKE_METHODS_BALANCED",
     "VIDEO_EXTENSIONS",
     "generate_user_id",
     "send_to_google_sheet",
     "get_video_catalog",
     "build_video_pools",
+    "shuffle_video_pools",
     "sample_initial_videos",
     "fetch_replacement",
     "get_playback_path",
