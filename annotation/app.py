@@ -60,8 +60,8 @@ if "user_id" not in st.session_state:
     st.session_state.user_id = generate_user_id()
 if "video_index" not in st.session_state:
     st.session_state.video_index = 0
-# if "annotations" not in st.session_state:
-#     st.session_state.annotations = []
+if "annotations" not in st.session_state:
+    st.session_state.annotations = []
 if "video_list" not in st.session_state:
     st.session_state.video_list = []
 if "awaiting_explanation" not in st.session_state:
@@ -126,8 +126,8 @@ if st.session_state.video_index >= total:
     # with open(master, "w", encoding="utf-8") as f:
     #     json.dump(st.session_state.annotations, f, indent=4)
 
-    # correct = sum(1 for ann in st.session_state.annotations if ann["ai_generated"] == (ann["ground_truth"] == "Fake"))
-    # st.markdown(f"## You classified **{correct}/{total}** videos correctly!")
+    correct = sum(1 for ann in st.session_state.annotations if ann["ai_generated"] == (ann["ground_truth"] == "Fake"))
+    st.markdown(f"## You classified **{correct}/{total}** videos correctly!")
     st.balloons()
     st.stop()
 
@@ -165,7 +165,7 @@ if st.session_state.awaiting_explanation:
         ann["timestamp"] = datetime.now(timezone.utc).isoformat()
         with st.spinner("Saving your answer..."):
             # save_annotation(ann, video_path)
-            # st.session_state.annotations.append(ann)
+            st.session_state.annotations.append(ann)
 
             row = [
                 st.session_state.user_id,
