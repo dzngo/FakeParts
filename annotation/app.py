@@ -117,6 +117,34 @@ def ensure_video_playback(video_idx: int):
         return None, st.session_state.video_list[video_idx]
 
 
+def record_annotation(annotation: dict, user_answer: str, comment: str, video_path, idx: int):
+    """Persist the user's response locally and in Google Sheets."""
+
+    ann_record = dict(annotation)
+    ann_record["explanation"] = comment
+    ann_record["timestamp"] = datetime.now(timezone.utc).isoformat()
+    ann_record["user_answer"] = user_answer
+
+    with st.spinner("Saving your answer..."):
+        st.session_state.annotations.append(ann_record)
+
+        row = [
+            st.session_state.user_id,
+            idx + 1,
+            str(video_path),
+            video_path.name,
+            video_path.label,
+            getattr(video_path, "method", ""),
+            user_answer,
+            comment,
+            ann_record["timestamp"],
+        ]
+        try:
+            send_to_google_sheet(row)
+        except Exception as e:  # pylint: disable=broad-except
+            st.error(f"❌ Error writing to Google Sheet: {e}")
+
+
 total = len(st.session_state.video_list)
 
 if st.session_state.video_index >= total:
@@ -126,8 +154,16 @@ if st.session_state.video_index >= total:
     # with open(master, "w", encoding="utf-8") as f:
     #     json.dump(st.session_state.annotations, f, indent=4)
 
-    correct = sum(1 for ann in st.session_state.annotations if ann["ai_generated"] == (ann["ground_truth"] == "Fake"))
-    st.markdown(f"## You classified **{correct}/{total}** videos correctly!")
+    reported = sum(1 for ann in st.session_state.annotations if ann.get("reported"))
+    answered_annotations = [ann for ann in st.session_state.annotations if not ann.get("reported")]
+    answered_total = len(answered_annotations)
+    if answered_total:
+        correct = sum(1 for ann in answered_annotations if ann.get("ai_generated") == (ann["ground_truth"] == "Fake"))
+        st.markdown(f"## You classified **{correct}/{answered_total}** answered videos correctly!")
+    else:
+        st.markdown("## All videos were reported. Thank you for your vigilance!")
+    if reported:
+        st.info(f"You reported {reported} video(s) for violent content.")
     st.balloons()
     st.stop()
 
@@ -161,28 +197,8 @@ if st.session_state.awaiting_explanation:
     col_next, col_back = st.columns([2, 1])
     if col_next.button("Next Video", key=f"next_{idx}"):
         ann = st.session_state.current_ann
-        ann["explanation"] = reason
-        ann["timestamp"] = datetime.now(timezone.utc).isoformat()
-        with st.spinner("Saving your answer..."):
-            # save_annotation(ann, video_path)
-            st.session_state.annotations.append(ann)
-
-            row = [
-                st.session_state.user_id,
-                idx + 1,
-                str(video_path),
-                video_path.name,
-                video_path.label,
-                getattr(video_path, "method", ""),
-                "Yes" if ann["ai_generated"] else "No",
-                reason,
-                ann["timestamp"],
-            ]
-            try:
-                send_to_google_sheet(row)
-            except Exception as e:  # pylint: disable=broad-except
-                st.error(f"❌ Error writing to Google Sheet: {e}")
-
+        user_answer = "Yes" if ann["ai_generated"] else "No"
+        record_annotation(ann, user_answer, reason, video_path, idx)
         st.session_state.awaiting_explanation = False
         st.session_state.current_ann = {}
         st.session_state.video_index += 1
@@ -194,7 +210,12 @@ if st.session_state.awaiting_explanation:
     st.stop()
 
 st.subheader("Is this video AI-generated?")
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
+st.info(
+    "We do our best to filter violent content. If this video feels violent or distressing, "
+    "please click **Report, violent content** to skip it."
+)
+
 
 if col1.button("Yes", key=f"yes_{idx}"):
     st.session_state.current_ann = {
@@ -220,4 +241,21 @@ if col2.button("No", key=f"no_{idx}"):
         "drive_id": getattr(video_path, "id", ""),
     }
     st.session_state.awaiting_explanation = True
+    st.rerun()
+
+if col3.button("Report, violent content", key=f"report_{idx}"):
+    report_annotation = {
+        "video": video_path.name,
+        "ground_truth": video_path.label,
+        "method": getattr(video_path, "method", ""),
+        "ai_generated": None,
+        "video_url": str(video_path),
+        "video_source": "drive" if is_drive_video(video_path) else "local",
+        "drive_id": getattr(video_path, "id", ""),
+        "reported": True,
+    }
+    record_annotation(report_annotation, "Reported", "Flagged as violent content", video_path, idx)
+    st.session_state.awaiting_explanation = False
+    st.session_state.current_ann = {}
+    st.session_state.video_index += 1
     st.rerun()
